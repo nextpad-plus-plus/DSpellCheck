@@ -926,23 +926,225 @@ static void cmdSettings() {
     }
 }
 
-// Download Dictionaries — full dialog (LibreOffice list + install) built next phase.
-static void showDownloadDialog() {
+// ===========================================================================
+// HTTP helper (synchronous GET on a background queue, with a User-Agent so the
+// GitHub API doesn't 403). Never call from the main thread.
+// ===========================================================================
+static NSData *httpGet(NSString *urlStr, NSString **errOut) {
+    __block NSData *result = nil; __block NSString *err = nil;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    [req setValue:@"Nextpad++-DSpellCheck" forHTTPHeaderField:@"User-Agent"];
+    req.timeoutInterval = 15;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *e) {
+            NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+            if (e) err = e.localizedDescription;
+            else if (code >= 400) err = [NSString stringWithFormat:@"HTTP %ld", (long)code];
+            else result = data;
+            dispatch_semaphore_signal(sem);
+        }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)20 * NSEC_PER_SEC));
+    if (errOut) *errOut = err;
+    return result;
+}
+
+// ===========================================================================
+// Download Dictionaries dialog (LibreOffice GitHub list + install)
+// ===========================================================================
+@interface DSCDownload : NSObject <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) NSTextField *urlField;
+@property(nonatomic, strong) NSTextField *status;
+@property(nonatomic, strong) NSTableView *table;
+@property(nonatomic, strong) NSMutableArray<NSMutableDictionary *> *rows;     // all
+@property(nonatomic, strong) NSMutableArray<NSMutableDictionary *> *shown;    // filtered
+@property(nonatomic, strong) NSButton *onlyRecognized;
+@property(nonatomic, strong) NSButton *installBtn;
+@property(nonatomic, strong) NSString *downloadBase;   // raw base url incl trailing /
+@end
+
+@implementation DSCDownload
+- (instancetype)init { if ((self = [super init])) { _rows = [NSMutableArray array]; _shown = [NSMutableArray array]; [self build]; } return self; }
+
+- (void)build {
+    NSRect r = NSMakeRect(0, 0, 560, 520);
+    _window = [[NSWindow alloc] initWithContentRect:r
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:YES];
+    _window.title = @"Download Dictionaries Dialog";
+    _window.releasedWhenClosed = NO; _window.delegate = self;
+    _window.minSize = NSMakeSize(460, 380);
+    NSView *root = _window.contentView;
+
+    _urlField = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 484, 536, 24)];
+    _urlField.stringValue = @"https://github.com/LibreOffice/dictionaries";
+    _urlField.editable = NO; _urlField.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin; [root addSubview:_urlField];
+
+    _status = [NSTextField labelWithString:@"Status: loading list…"];
+    _status.frame = NSMakeRect(12, 458, 536, 20); _status.textColor = [NSColor systemGreenColor];
+    _status.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin; [root addSubview:_status];
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 86, 536, 364)];
+    scroll.hasVerticalScroller = YES; scroll.borderType = NSBezelBorder;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _table = [[NSTableView alloc] initWithFrame:scroll.bounds];
+    _table.headerView = nil; _table.allowsMultipleSelection = YES; _table.rowHeight = 20;
+    _table.dataSource = self; _table.delegate = self;
+    NSTableColumn *cCheck = [[NSTableColumn alloc] initWithIdentifier:@"chk"]; cCheck.width = 24;
+    NSTableColumn *cName = [[NSTableColumn alloc] initWithIdentifier:@"name"]; cName.width = 490;
+    [_table addTableColumn:cCheck]; [_table addTableColumn:cName];
+    scroll.documentView = _table; [root addSubview:scroll];
+
+    _onlyRecognized = [NSButton checkboxWithTitle:@"Show Only Recognized Ones" target:self action:@selector(filterChanged:)];
+    _onlyRecognized.frame = NSMakeRect(12, 48, 230, 20); _onlyRecognized.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin; [root addSubview:_onlyRecognized];
+    NSButton *allUsers = [NSButton checkboxWithTitle:@"Install for All Users" target:nil action:nil];
+    allUsers.frame = NSMakeRect(12, 70, 230, 20); allUsers.enabled = NO; // single-user on macOS
+    allUsers.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin; [root addSubview:allUsers];
+
+    NSButton *refresh = [NSButton buttonWithTitle:@"↻" target:self action:@selector(refresh:)];
+    refresh.frame = NSMakeRect(250, 44, 36, 28); refresh.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin; [root addSubview:refresh];
+    NSButton *conn = [NSButton buttonWithTitle:@"Connection Settings…" target:self action:@selector(connSettings:)];
+    conn.frame = NSMakeRect(300, 70, 248, 28); conn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin; [root addSubview:conn];
+
+    _installBtn = [NSButton buttonWithTitle:@"Install Selected" target:self action:@selector(install:)];
+    _installBtn.frame = NSMakeRect(300, 12, 150, 30); _installBtn.autoresizingMask = NSViewMinXMargin; _installBtn.enabled = NO; [root addSubview:_installBtn];
+    NSButton *exit = [NSButton buttonWithTitle:@"Exit" target:self action:@selector(exit:)];
+    exit.frame = NSMakeRect(458, 12, 90, 30); exit.keyEquivalent = @"\e"; exit.autoresizingMask = NSViewMinXMargin; [root addSubview:exit];
+}
+
+// ---- list fetch ----
+- (void)refresh:(id)s { [self loadList]; }
+- (void)loadList {
+    self.status.stringValue = @"Status: loading list…"; self.status.textColor = [NSColor systemGrayColor];
+    [self.rows removeAllObjects]; [self.shown removeAllObjects]; [self.table reloadData];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *err = nil; NSData *data = nil; NSString *branch = @"master";
+        for (NSString *b in @[@"master", @"main"]) {
+            data = httpGet([NSString stringWithFormat:@"https://api.github.com/repos/LibreOffice/dictionaries/git/trees/%@?recursive=1", b], &err);
+            if (data) { branch = b; break; }
+        }
+        if (!data) { dispatch_async(dispatch_get_main_queue(), ^{ self.status.stringValue = [NSString stringWithFormat:@"Status: error loading list (%@)", err ?: @"?"]; self.status.textColor = [NSColor systemRedColor]; }); return; }
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray *tree = json[@"tree"];
+        NSMutableSet *paths = [NSMutableSet set];
+        for (NSDictionary *node in tree) if ([node[@"type"] isEqualToString:@"blob"]) [paths addObject:node[@"path"]];
+        NSMutableArray *built = [NSMutableArray array];
+        NSString *base = [NSString stringWithFormat:@"https://raw.githubusercontent.com/LibreOffice/dictionaries/%@/", branch];
+        for (NSDictionary *node in tree) {
+            if (![node[@"type"] isEqualToString:@"blob"]) continue;
+            NSString *path = node[@"path"];
+            if (![path.pathExtension isEqualToString:@"aff"]) continue;
+            NSString *dicPath = [[path stringByDeletingPathExtension] stringByAppendingPathExtension:@"dic"];
+            if (![paths containsObject:dicPath]) continue;
+            std::string code = nsToStd(path.lastPathComponent.stringByDeletingPathExtension);
+            NSString *display = languageDisplayName(code);
+            BOOL recognized = ![display isEqualToString:stdToNs(code)];
+            [built addObject:[@{ @"code": stdToNs(code), @"aff": path, @"display": display,
+                                 @"recognized": @(recognized), @"checked": @NO } mutableCopy]];
+        }
+        [built sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"display"] caseInsensitiveCompare:b[@"display"]]; }];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.downloadBase = base;
+            [self.rows setArray:built];
+            [self applyFilter];
+            self.status.stringValue = [NSString stringWithFormat:@"Status: List of available files was successfully loaded (%lu)", (unsigned long)built.count];
+            self.status.textColor = [NSColor systemGreenColor];
+        });
+    });
+}
+- (void)applyFilter {
+    [self.shown removeAllObjects];
+    BOOL only = (self.onlyRecognized.state == NSControlStateValueOn);
+    for (NSMutableDictionary *r in self.rows) if (!only || [r[@"recognized"] boolValue]) [self.shown addObject:r];
+    [self.table reloadData];
+    [self updateInstallEnabled];
+}
+- (void)filterChanged:(id)s { [self applyFilter]; }
+- (void)updateInstallEnabled {
+    BOOL any = NO; for (NSMutableDictionary *r in self.rows) if ([r[@"checked"] boolValue]) { any = YES; break; }
+    self.installBtn.enabled = any;
+}
+
+// ---- table ----
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)t { return self.shown.count; }
+- (NSView *)tableView:(NSTableView *)tv viewForTableColumn:(NSTableColumn *)col row:(NSInteger)row {
+    NSMutableDictionary *r = self.shown[row];
+    if ([col.identifier isEqualToString:@"chk"]) {
+        NSButton *b = [NSButton checkboxWithTitle:@"" target:self action:@selector(toggleRow:)];
+        b.state = [r[@"checked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+        b.tag = row; return b;
+    }
+    NSTextField *tf = [NSTextField labelWithString:r[@"display"]];
+    return tf;
+}
+- (void)toggleRow:(NSButton *)sender {
+    NSInteger row = sender.tag;
+    if (row >= 0 && row < (NSInteger)self.shown.count) {
+        self.shown[row][@"checked"] = @(sender.state == NSControlStateValueOn);
+        [self updateInstallEnabled];
+    }
+}
+
+// ---- install ----
+- (void)install:(id)s {
+    NSMutableArray *toGet = [NSMutableArray array];
+    for (NSMutableDictionary *r in self.rows) if ([r[@"checked"] boolValue]) [toGet addObject:r];
+    if (toGet.count == 0) return;
+    NSString *base = self.downloadBase; std::string dir = dictDir();
+    self.installBtn.enabled = NO;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int ok = 0; NSString *lastErr = nil;
+        for (NSDictionary *r in toGet) {
+            NSString *aff = r[@"aff"];
+            NSString *dic = [[aff stringByDeletingPathExtension] stringByAppendingPathExtension:@"dic"];
+            NSString *code = r[@"display"];
+            dispatch_async(dispatch_get_main_queue(), ^{ self.status.stringValue = [NSString stringWithFormat:@"Status: downloading %@…", code]; self.status.textColor = [NSColor systemGrayColor]; });
+            NSString *e1 = nil, *e2 = nil;
+            NSData *affData = httpGet([base stringByAppendingString:aff], &e1);
+            NSData *dicData = httpGet([base stringByAppendingString:dic], &e2);
+            if (affData && dicData) {
+                NSString *codeStr = r[@"code"];
+                [affData writeToFile:[NSString stringWithFormat:@"%s/%@.aff", dir.c_str(), codeStr] atomically:YES];
+                [dicData writeToFile:[NSString stringWithFormat:@"%s/%@.dic", dir.c_str(), codeStr] atomically:YES];
+                ok++;
+            } else lastErr = e1 ?: e2;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_engine.scan();
+            if (!g_set.multi_mode) g_engine.setLanguage(g_set.language);
+            recheckVisible();
+            self.status.stringValue = (ok == (int)toGet.count)
+                ? [NSString stringWithFormat:@"Status: installed %d dictionary(ies)", ok]
+                : [NSString stringWithFormat:@"Status: installed %d of %lu (%@)", ok, (unsigned long)toGet.count, lastErr ?: @"error"];
+            self.status.textColor = (ok == (int)toGet.count) ? [NSColor systemGreenColor] : [NSColor systemRedColor];
+            for (NSMutableDictionary *rr in self.rows) rr[@"checked"] = @NO;
+            [self.table reloadData];
+        });
+    });
+}
+
+- (void)connSettings:(id)s {
     @autoreleasepool {
         NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"Download Dictionaries";
-        a.informativeText = @"Place Hunspell .aff/.dic dictionary pairs in the dictionaries folder, "
-            "then use Reload Hunspell Dictionaries.\n\n"
-            "Dictionaries: https://github.com/LibreOffice/dictionaries\n\n"
-            "(In-app download dialog is being added in a follow-up build.)";
-        [a addButtonWithTitle:@"Open LibreOffice Dictionaries"];
-        [a addButtonWithTitle:@"Reveal Folder"];
-        [a addButtonWithTitle:@"Close"];
-        NSModalResponse r = [a runModal];
-        if (r == NSAlertFirstButtonReturn)
-            [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://github.com/LibreOffice/dictionaries"]];
-        else if (r == NSAlertSecondButtonReturn)
-            [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:stdToNs(dictDir())]];
+        a.messageText = @"Connection Settings";
+        a.informativeText = @"Downloads use HTTPS via macOS networking, which honors your "
+            "system-wide proxy configuration (System Settings ▸ Network ▸ Proxies).\n\n"
+            "No plugin-specific proxy/FTP setup is required on macOS.";
+        [a addButtonWithTitle:@"OK"]; [a runModal];
+    }
+}
+- (void)exit:(id)s { [NSApp stopModal]; }
+- (void)windowWillClose:(NSNotification *)n { [NSApp stopModal]; }
+- (void)run { [self.window center]; [self loadList]; [NSApp runModalForWindow:self.window]; [self.window orderOut:nil]; }
+@end
+
+static void showDownloadDialog() {
+    @autoreleasepool {
+        static DSCDownload *dlg = nil;
+        dlg = [[DSCDownload alloc] init];
+        [dlg run];
     }
 }
 
