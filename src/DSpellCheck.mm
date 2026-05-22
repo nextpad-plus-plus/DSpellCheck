@@ -695,7 +695,9 @@ static void cmdAdditionalActions() {
             intptr_t len = sciLen(); std::string all = sciGetRange(0, len);
             std::set<intptr_t> lines;
             for (auto &t : tokenize(all)) { std::string w = trimApostrophes(t.text); if (shouldCheckWord(w) && !g_engine.check(w)) lines.insert(sci(SCI_LINEFROMPOSITION,(uintptr_t)t.start)); }
-            for (auto ln : lines) { sci(SCI_MARKERADD, (uintptr_t)ln, 24 /*bookmark marker*/); }
+            // Host draws bookmarks on Scintilla marker 20 (kBookmarkMarker); NPPM_GETBOOKMARKID
+            // reports 24 but the host actually uses 20, so use 20 to match what's visible.
+            for (auto ln : lines) { sci(SCI_MARKERADD, (uintptr_t)ln, 20); }
         });
         add(@"Replace with Topmost Suggestion", ^{ replaceWithTopSuggestion(); });
         add(@"Ignore Word at Cursor", ^{ ignoreWordAtCursor(); });
@@ -956,6 +958,32 @@ static void doRecheckSoon() {
 }
 
 // ===========================================================================
+// Right-click on a misspelled word → suggestions popup (Windows context-menu
+// behavior). App-wide local NSEvent monitor; consumes the event only when it
+// lands on a misspelled word in the editor, otherwise passes through so the
+// normal context menu still appears.
+// ===========================================================================
+static id g_rightClickMonitor = nil;
+static void installRightClickMonitor() {
+    if (g_rightClickMonitor) return;
+    g_rightClickMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskRightMouseDown
+        handler:^NSEvent *(NSEvent *e) {
+            if (!g_set.auto_check_text || !g_engine.working() || !e.window) return e;
+            NSView *hit = [e.window.contentView hitTest:e.locationInWindow];
+            if (!hit) return e;
+            NSPoint p = [hit convertPoint:e.locationInWindow fromView:nil];
+            intptr_t pos = sci(SCI_POSITIONFROMPOINTCLOSE, (uintptr_t)(NSInteger)p.x, (intptr_t)(NSInteger)p.y);
+            if (pos < 0) return e;
+            intptr_t ws, we; std::string word;
+            if (!wordAt(pos, ws, we, word)) return e;
+            std::string w = trimApostrophes(word);
+            if (!shouldCheckWord(w) || g_engine.check(w)) return e; // not a misspelling → default menu
+            dispatch_async(dispatch_get_main_queue(), ^{ showSuggestionsForPosition(pos); });
+            return (NSEvent *)nil; // consume — show our suggestions instead
+        }];
+}
+
+// ===========================================================================
 // Toolbar icon
 // ===========================================================================
 static void handleToolbarModification() {
@@ -994,7 +1022,7 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
     if (!n) return;
     switch (n->nmhdr.code) {
         case NPPN_TBMODIFICATION: handleToolbarModification(); break;
-        case NPPN_READY: applyIndicatorStyle(); if (g_set.auto_check_text) recheckVisible(); break;
+        case NPPN_READY: applyIndicatorStyle(); installRightClickMonitor(); if (g_set.auto_check_text) recheckVisible(); break;
         case NPPN_BUFFERACTIVATED: if (g_set.auto_check_text) doRecheckSoon(); break;
         case SCN_MODIFIED:
             if ((n->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) && g_set.auto_check_text) doRecheckSoon();
