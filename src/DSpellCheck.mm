@@ -634,6 +634,7 @@ static void ignoreWordAtCursor() {
 // Menu actions
 // ===========================================================================
 static void doRecheckSoon();
+static void showDownloadDialog();
 
 static void cmdAutoCheck() {
     g_set.auto_check_text = !g_set.auto_check_text;
@@ -661,8 +662,9 @@ static void cmdChangeLang() {
             }
         }
         [menu addItem:[NSMenuItem separatorItem]];
-        NSMenuItem *dl = [[NSMenuItem alloc] initWithTitle:@"Download Languages…" action:nil keyEquivalent:@""];
-        dl.enabled = NO; // wired in download phase
+        NSMenuItem *dl = [[NSMenuItem alloc] initWithTitle:@"Download Languages…" action:@selector(invokeBlock:) keyEquivalent:@""];
+        dl.target = [DSCBlockInvoker shared];
+        dl.representedObject = [^{ showDownloadDialog(); } copy];
         [menu addItem:dl];
         [menu popUpMenuPositioningItem:nil atLocation:[NSEvent mouseLocation] inView:nil];
     }
@@ -724,18 +726,220 @@ static void cmdAbout() {
 @end
 
 // ===========================================================================
-// Settings dialog (Simple-tab essentials) — built in this phase
+// Settings dialog (Simple + Advanced tabs) — matches the Windows layout
 // ===========================================================================
+static void showDownloadDialog();   // defined in download phase
+
+@interface DSCSettings : NSObject <NSWindowDelegate>
+@property(nonatomic, strong) NSWindow *window;
+// Simple tab
+@property(nonatomic, strong) NSTextField *pathField;
+@property(nonatomic, strong) NSPopUpButton *namingStyle;
+@property(nonatomic, strong) NSPopUpButton *language;
+@property(nonatomic, strong) NSTextField *maxSugg;
+@property(nonatomic, strong) NSButton *radioThose, *radioNotThose;
+@property(nonatomic, strong) NSTextField *fileTypes;
+@property(nonatomic, strong) NSButton *cbComments, *cbStrings, *cbVarNames;
+@property(nonatomic, strong) NSButton *cbSelectWord;
+// Advanced tab
+@property(nonatomic, strong) NSButton *igDigit, *igStartCap, *igHaveCap, *igAllCap, *igOne, *igUnderscore;
+@property(nonatomic, strong) NSTextField *minLen;
+@end
+
+@implementation DSCSettings
+
+- (instancetype)init { if ((self = [super init])) [self build]; return self; }
+
+- (NSTextField *)lbl:(NSString *)s frame:(NSRect)f to:(NSView *)v {
+    NSTextField *t = [NSTextField labelWithString:s]; t.frame = f; [v addSubview:t]; return t;
+}
+
+- (void)build {
+    NSRect r = NSMakeRect(0, 0, 560, 620);
+    _window = [[NSWindow alloc] initWithContentRect:r
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+        backing:NSBackingStoreBuffered defer:YES];
+    _window.title = @"DSpellCheck Settings";
+    _window.releasedWhenClosed = NO; _window.delegate = self;
+    NSView *root = _window.contentView;
+
+    NSTabView *tabs = [[NSTabView alloc] initWithFrame:NSMakeRect(12, 56, 536, 552)];
+    [root addSubview:tabs];
+    NSTabViewItem *simple = [[NSTabViewItem alloc] initWithIdentifier:@"simple"]; simple.label = @"Simple";
+    NSTabViewItem *adv = [[NSTabViewItem alloc] initWithIdentifier:@"advanced"]; adv.label = @"Advanced";
+    [tabs addTabViewItem:simple]; [tabs addTabViewItem:adv];
+    NSView *sv = [[NSView alloc] initWithFrame:NSMakeRect(0,0,520,520)]; simple.view = sv;
+    NSView *av = [[NSView alloc] initWithFrame:NSMakeRect(0,0,520,520)]; adv.view = av;
+
+    // ---- Simple tab (top-down; y measured from bottom) ----
+    CGFloat W = 520;
+    [self lbl:@"Library:" frame:NSMakeRect(12, 484, 70, 20) to:sv];
+    NSPopUpButton *lib = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(86, 480, 150, 26)];
+    [lib addItemWithTitle:@"Hunspell"]; [sv addSubview:lib];
+
+    NSBox *hbox = [[NSBox alloc] initWithFrame:NSMakeRect(12, 350, W-24, 122)];
+    hbox.title = @"Hunspell Settings"; [sv addSubview:hbox];
+    [self lbl:@"Hunspell Dictionaries Path" frame:NSMakeRect(10, 78, 220, 18) to:hbox];
+    _pathField = [[NSTextField alloc] initWithFrame:NSMakeRect(10, 56, W-24-60, 22)];
+    _pathField.stringValue = stdToNs(dictDir()); [hbox addSubview:_pathField];
+    NSButton *browse = [NSButton buttonWithTitle:@"…" target:self action:@selector(browse:)];
+    browse.frame = NSMakeRect(W-24-46, 55, 36, 24); [hbox addSubview:browse];
+    NSButton *download = [NSButton buttonWithTitle:@"Download…" target:self action:@selector(download:)];
+    download.frame = NSMakeRect(10, 12, 130, 28); [hbox addSubview:download];
+    NSButton *remove = [NSButton buttonWithTitle:@"Remove Dictionaries…" target:self action:@selector(removeDicts:)];
+    remove.frame = NSMakeRect(150, 12, 180, 28); [hbox addSubview:remove];
+    NSButton *reveal = [NSButton buttonWithTitle:@"Reveal" target:self action:@selector(reveal:)];
+    reveal.frame = NSMakeRect(W-24-90, 12, 80, 28); [hbox addSubview:reveal];
+
+    [self lbl:@"Language Naming Style:" frame:NSMakeRect(12, 318, 170, 20) to:sv];
+    _namingStyle = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(190, 314, 180, 26)];
+    [_namingStyle addItemsWithTitles:@[@"Original", @"English", @"Native"]]; [sv addSubview:_namingStyle];
+
+    [self lbl:@"Language:" frame:NSMakeRect(12, 286, 170, 20) to:sv];
+    _language = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(190, 282, 180, 26)]; [sv addSubview:_language];
+
+    [self lbl:@"Max Number of Suggestions:" frame:NSMakeRect(12, 254, 220, 20) to:sv];
+    _maxSugg = [[NSTextField alloc] initWithFrame:NSMakeRect(240, 252, 60, 22)]; [sv addSubview:_maxSugg];
+
+    NSBox *fbox = [[NSBox alloc] initWithFrame:NSMakeRect(12, 150, W-24, 92)];
+    fbox.title = @"File Types (Separate with semicolon ; )"; [fbox setContentViewMargins:NSMakeSize(6,4)]; [sv addSubview:fbox];
+    _radioThose = [NSButton radioButtonWithTitle:@"Check only those:" target:self action:@selector(radioChanged:)];
+    _radioThose.frame = NSMakeRect(10, 42, 180, 20); [fbox addSubview:_radioThose];
+    _radioNotThose = [NSButton radioButtonWithTitle:@"Check only NOT those:" target:self action:@selector(radioChanged:)];
+    _radioNotThose.frame = NSMakeRect(220, 42, 200, 20); [fbox addSubview:_radioNotThose];
+    _fileTypes = [[NSTextField alloc] initWithFrame:NSMakeRect(10, 12, W-44, 22)]; [fbox addSubview:_fileTypes];
+
+    NSBox *cbox = [[NSBox alloc] initWithFrame:NSMakeRect(12, 86, W-24, 56)];
+    cbox.title = @"In code, check only:"; [sv addSubview:cbox];
+    _cbComments = [NSButton checkboxWithTitle:@"Comments" target:nil action:nil]; _cbComments.frame = NSMakeRect(10, 8, 110, 20); [cbox addSubview:_cbComments];
+    _cbStrings = [NSButton checkboxWithTitle:@"Strings" target:nil action:nil]; _cbStrings.frame = NSMakeRect(130, 8, 100, 20); [cbox addSubview:_cbStrings];
+    _cbVarNames = [NSButton checkboxWithTitle:@"Function/Variable names" target:nil action:nil]; _cbVarNames.frame = NSMakeRect(240, 8, 230, 20); [cbox addSubview:_cbVarNames];
+
+    [self lbl:@"Suggestions Control:" frame:NSMakeRect(12, 54, 160, 20) to:sv];
+    NSPopUpButton *sc = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(180, 50, 200, 26)];
+    [sc addItemWithTitle:@"Use N++ Context Menu"]; [sv addSubview:sc];
+    _cbSelectWord = [NSButton checkboxWithTitle:@"Select the Misspelled Words when Menu is Triggered" target:nil action:nil];
+    _cbSelectWord.frame = NSMakeRect(12, 20, W-24, 20); [sv addSubview:_cbSelectWord];
+
+    // ---- Advanced tab ----
+    [self lbl:@"Ignore words that…" frame:NSMakeRect(12, 484, 300, 20) to:av];
+    _igDigit = [NSButton checkboxWithTitle:@"…contain a digit" target:nil action:nil]; _igDigit.frame = NSMakeRect(20, 456, 300, 20); [av addSubview:_igDigit];
+    _igStartCap = [NSButton checkboxWithTitle:@"…start with a capital letter" target:nil action:nil]; _igStartCap.frame = NSMakeRect(20, 432, 300, 20); [av addSubview:_igStartCap];
+    _igHaveCap = [NSButton checkboxWithTitle:@"…have a capital letter not at the start (camelCase, ALLCAPS)" target:nil action:nil]; _igHaveCap.frame = NSMakeRect(20, 408, 460, 20); [av addSubview:_igHaveCap];
+    _igAllCap = [NSButton checkboxWithTitle:@"…are entirely capitalized" target:nil action:nil]; _igAllCap.frame = NSMakeRect(20, 384, 300, 20); [av addSubview:_igAllCap];
+    _igOne = [NSButton checkboxWithTitle:@"…are a single letter" target:nil action:nil]; _igOne.frame = NSMakeRect(20, 360, 300, 20); [av addSubview:_igOne];
+    _igUnderscore = [NSButton checkboxWithTitle:@"…contain an underscore" target:nil action:nil]; _igUnderscore.frame = NSMakeRect(20, 336, 300, 20); [av addSubview:_igUnderscore];
+    [self lbl:@"Minimum word length to check:" frame:NSMakeRect(20, 300, 230, 20) to:av];
+    _minLen = [[NSTextField alloc] initWithFrame:NSMakeRect(252, 298, 60, 22)]; [av addSubview:_minLen];
+
+    // ---- bottom buttons ----
+    NSButton *ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(ok:)]; ok.frame = NSMakeRect(300, 14, 78, 30); ok.keyEquivalent = @"\r"; [root addSubview:ok];
+    NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(cancel:)]; cancel.frame = NSMakeRect(386, 14, 78, 30); cancel.keyEquivalent = @"\e"; [root addSubview:cancel];
+    NSButton *apply = [NSButton buttonWithTitle:@"Apply" target:self action:@selector(apply:)]; apply.frame = NSMakeRect(472, 14, 78, 30); [root addSubview:apply];
+
+    [self loadFromSettings];
+    self.namingStyle.target = self; self.namingStyle.action = @selector(namingChanged:);
+}
+
+- (void)loadFromSettings {
+    g_engine.scan();
+    _pathField.stringValue = stdToNs(dictDir());
+    NSString *ns = stdToNs(g_set.language_name_style);
+    [_namingStyle selectItemWithTitle:[ns capitalizedString]];
+    [self rebuildLanguageList];
+    _maxSugg.stringValue = [NSString stringWithFormat:@"%d", g_set.suggestion_count];
+    _radioThose.state = g_set.check_those ? NSControlStateValueOn : NSControlStateValueOff;
+    _radioNotThose.state = g_set.check_those ? NSControlStateValueOff : NSControlStateValueOn;
+    _fileTypes.stringValue = stdToNs(g_set.file_types);
+    _cbSelectWord.state = g_set.select_word_on_context_menu_click ? NSControlStateValueOn : NSControlStateValueOff;
+    _cbComments.state = NSControlStateValueOn; _cbStrings.state = NSControlStateValueOn; // cosmetic defaults
+    _igDigit.state = g_set.ignore_containing_digit ? NSControlStateValueOn : NSControlStateValueOff;
+    _igStartCap.state = g_set.ignore_starting_with_capital ? NSControlStateValueOn : NSControlStateValueOff;
+    _igHaveCap.state = g_set.ignore_having_a_capital ? NSControlStateValueOn : NSControlStateValueOff;
+    _igAllCap.state = g_set.ignore_all_capital ? NSControlStateValueOn : NSControlStateValueOff;
+    _igOne.state = g_set.ignore_one_letter ? NSControlStateValueOn : NSControlStateValueOff;
+    _igUnderscore.state = g_set.ignore_having_underscore ? NSControlStateValueOn : NSControlStateValueOff;
+    _minLen.stringValue = [NSString stringWithFormat:@"%d", g_set.word_minimum_length];
+}
+- (void)rebuildLanguageList {
+    [_language removeAllItems];
+    for (auto &kv : g_engine.available) {
+        [_language addItemWithTitle:languageDisplayName(kv.first)];
+        _language.lastItem.representedObject = stdToNs(kv.first);
+        if (kv.first == g_set.language) [_language selectItem:_language.lastItem];
+    }
+}
+- (void)namingChanged:(id)s {
+    int idx = (int)_namingStyle.indexOfSelectedItem;
+    g_set.language_name_style = (idx==0?"original":(idx==2?"native":"english"));
+    [self rebuildLanguageList];
+}
+- (void)radioChanged:(NSButton *)sender {
+    _radioThose.state = (sender==_radioThose) ? NSControlStateValueOn : NSControlStateValueOff;
+    _radioNotThose.state = (sender==_radioNotThose) ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)browse:(id)s {
+    NSOpenPanel *op = [NSOpenPanel openPanel]; op.canChooseDirectories = YES; op.canChooseFiles = NO;
+    if ([op runModal] == NSModalResponseOK && op.URL) _pathField.stringValue = op.URL.path;
+}
+- (void)download:(id)s { showDownloadDialog(); }
+- (void)removeDicts:(id)s { [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:stdToNs(dictDir())]]; }
+- (void)reveal:(id)s { [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:stdToNs(dictDir())]]; }
+
+- (void)applySettings {
+    [self.window makeFirstResponder:nil];
+    int idx = (int)_namingStyle.indexOfSelectedItem;
+    g_set.language_name_style = (idx==0?"original":(idx==2?"native":"english"));
+    if (_language.selectedItem.representedObject) g_set.language = nsToStd(_language.selectedItem.representedObject);
+    g_set.suggestion_count = std::max(1, _maxSugg.intValue);
+    g_set.check_those = (_radioThose.state == NSControlStateValueOn);
+    g_set.file_types = nsToStd(_fileTypes.stringValue);
+    g_set.select_word_on_context_menu_click = (_cbSelectWord.state == NSControlStateValueOn);
+    g_set.ignore_containing_digit = (_igDigit.state == NSControlStateValueOn);
+    g_set.ignore_starting_with_capital = (_igStartCap.state == NSControlStateValueOn);
+    g_set.ignore_having_a_capital = (_igHaveCap.state == NSControlStateValueOn);
+    g_set.ignore_all_capital = (_igAllCap.state == NSControlStateValueOn);
+    g_set.ignore_one_letter = (_igOne.state == NSControlStateValueOn);
+    g_set.ignore_having_underscore = (_igUnderscore.state == NSControlStateValueOn);
+    g_set.word_minimum_length = std::max(0, _minLen.intValue);
+    std::string newPath = nsToStd(_pathField.stringValue);
+    if (newPath != g_set.hunspell_user_path && newPath != (configDir()+"/Hunspell")) g_set.hunspell_user_path = newPath;
+    saveSettings();
+    g_engine.scan();
+    if (!g_set.multi_mode) g_engine.setLanguage(g_set.language);
+    recheckVisible();
+}
+- (void)apply:(id)s { [self applySettings]; }
+- (void)ok:(id)s { [self applySettings]; [NSApp stopModal]; }
+- (void)cancel:(id)s { [NSApp stopModal]; }
+- (void)windowWillClose:(NSNotification *)n { [NSApp stopModal]; }
+- (void)run { [self.window center]; [NSApp runModalForWindow:self.window]; [self.window orderOut:nil]; }
+@end
+
 static void cmdSettings() {
-    // Placeholder until the full Simple+Advanced dialog is built next phase.
+    @autoreleasepool {
+        static DSCSettings *dlg = nil;
+        dlg = [[DSCSettings alloc] init];
+        [dlg run];
+    }
+}
+
+// Download Dictionaries — full dialog (LibreOffice list + install) built next phase.
+static void showDownloadDialog() {
     @autoreleasepool {
         NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"DSpellCheck Settings";
-        a.informativeText = [NSString stringWithFormat:
-            @"Dictionaries folder:\n%s\n\nActive language: %s\nInstalled dictionaries: %lu\n\n(Full settings dialog coming in the next build phase.)",
-            dictDir().c_str(), g_set.language.c_str(), (unsigned long)g_engine.available.size()];
-        [a addButtonWithTitle:@"OK"]; [a addButtonWithTitle:@"Reveal Dictionaries Folder"];
-        if ([a runModal] == NSAlertSecondButtonReturn)
+        a.messageText = @"Download Dictionaries";
+        a.informativeText = @"Place Hunspell .aff/.dic dictionary pairs in the dictionaries folder, "
+            "then use Reload Hunspell Dictionaries.\n\n"
+            "Dictionaries: https://github.com/LibreOffice/dictionaries\n\n"
+            "(In-app download dialog is being added in a follow-up build.)";
+        [a addButtonWithTitle:@"Open LibreOffice Dictionaries"];
+        [a addButtonWithTitle:@"Reveal Folder"];
+        [a addButtonWithTitle:@"Close"];
+        NSModalResponse r = [a runModal];
+        if (r == NSAlertFirstButtonReturn)
+            [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://github.com/LibreOffice/dictionaries"]];
+        else if (r == NSAlertSecondButtonReturn)
             [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:stdToNs(dictDir())]];
     }
 }
