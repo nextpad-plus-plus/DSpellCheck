@@ -13,9 +13,11 @@
 
 #include "NppPluginInterfaceMac.h"
 #include "Scintilla.h"
+#include "StyleCategory.h"
 #import <Cocoa/Cocoa.h>
 #include <hunspell/hunspell.hxx>
 #include <iconv.h>
+#include <fnmatch.h>
 
 #include <string>
 #include <vector>
@@ -115,6 +117,11 @@ struct Settings {
     // file types
     bool check_those = true;                 // true: check only matching; false: check only NOT matching
     std::string file_types = "*.*";
+    // in code, check only:
+    bool check_comments = true;
+    bool check_strings = true;
+    bool check_variable_functions = false;
+    bool check_default_udl_style = true;
     // suggestions
     bool select_word_on_context_menu_click = true;
     std::string language_name_style = "english"; // original/english/native
@@ -166,6 +173,10 @@ static void loadSettings() {
         I("word_minimum_length", g_set.word_minimum_length);
         B("check_those", g_set.check_those);
         S("file_types", g_set.file_types);
+        B("check_comments", g_set.check_comments);
+        B("check_strings", g_set.check_strings);
+        B("check_variable_functions", g_set.check_variable_functions);
+        B("check_default_udl_style", g_set.check_default_udl_style);
         B("select_word_on_context_menu_click", g_set.select_word_on_context_menu_click);
         S("language_name_style", g_set.language_name_style);
         S("hunspell_user_path", g_set.hunspell_user_path);
@@ -193,6 +204,10 @@ static void saveSettings() {
         I("word_minimum_length", g_set.word_minimum_length);
         B("check_those", g_set.check_those);
         S("file_types", g_set.file_types);
+        B("check_comments", g_set.check_comments);
+        B("check_strings", g_set.check_strings);
+        B("check_variable_functions", g_set.check_variable_functions);
+        B("check_default_udl_style", g_set.check_default_udl_style);
         B("select_word_on_context_menu_click", g_set.select_word_on_context_menu_click);
         S("language_name_style", g_set.language_name_style);
         S("hunspell_user_path", g_set.hunspell_user_path);
@@ -402,6 +417,45 @@ static bool shouldCheckWord(const std::string &w) {
 }
 
 // ===========================================================================
+// Lexer-style filter ("In code, check only Comments/Strings/...") + file-type
+// filter ("Check only those / NOT those").
+// ===========================================================================
+static bool styleAllowsCheck(intptr_t docPos) {
+    int lexer = (int)sci(SCI_GETLEXER);
+    int style = (int)sci(SCI_GETSTYLEAT, (uintptr_t)docPos);
+    switch (get_style_category(lexer, style, g_set.check_default_udl_style)) {
+        case StyleCategory::text:       return true;
+        case StyleCategory::comment:    return g_set.check_comments;
+        case StyleCategory::string:     return g_set.check_strings;
+        case StyleCategory::identifier: return g_set.check_variable_functions;
+        default:                        return false; // unknown
+    }
+}
+static bool globMatch(const std::string &pattern, const std::string &name) {
+    if (pattern == "*" || pattern == "*.*") return true;  // Windows PathMatchSpec treats *.* as all
+    return fnmatch(pattern.c_str(), name.c_str(), FNM_CASEFOLD) == 0;
+}
+static bool fileTypeAllowsCheck() {
+    char buf[2048] = {0};
+    npp(NPPM_GETFULLCURRENTPATH, sizeof(buf), (intptr_t)buf);
+    std::string path = buf;
+    if (path.empty()) return true; // untitled → check
+    std::string name = path;
+    auto slash = name.find_last_of('/'); if (slash != std::string::npos) name = name.substr(slash + 1);
+    // split file_types on ';'
+    std::vector<std::string> globs;
+    { std::string cur; for (char c : g_set.file_types) { if (c == ';') { if (!cur.empty()) globs.push_back(cur); cur.clear(); } else cur += c; } if (!cur.empty()) globs.push_back(cur); }
+    if (globs.empty()) return true;
+    if (g_set.check_those) {
+        for (auto &g : globs) if (globMatch(g, name)) return true;
+        return false;
+    } else {
+        for (auto &g : globs) if (globMatch(g, name)) return false;
+        return true;
+    }
+}
+
+// ===========================================================================
 // Indicator (squiggle) + live checking
 // ===========================================================================
 static int g_indicator = -1;
@@ -448,10 +502,12 @@ static void recheckVisible() {
     nppData._sendMessage(h, SCI_SETINDICATORCURRENT, (uintptr_t)g_indicator, 0);
     nppData._sendMessage(h, SCI_INDICATORCLEARRANGE, (uintptr_t)vs, ve - vs);
     if (!g_set.auto_check_text || !g_engine.working() || ve <= vs) return;
+    if (!fileTypeAllowsCheck()) return;   // file excluded by File Types setting
     std::string text = sciGetRange(vs, ve);
     for (auto &tok : tokenize(text)) {
         std::string w = trimApostrophes(tok.text);
         if (!shouldCheckWord(w)) continue;
+        if (!styleAllowsCheck(vs + tok.start)) continue;  // in-code comment/string filter
         if (g_engine.check(w)) continue;
         nppData._sendMessage(h, SCI_INDICATORFILLRANGE, (uintptr_t)(vs + tok.start), tok.end - tok.start);
     }
@@ -569,15 +625,16 @@ static void showSuggestionsForPosition(intptr_t pos) {
 // Find next / previous misspelling
 // ===========================================================================
 static void findMistake(bool forward) {
-    if (!g_engine.working()) { NSBeep(); return; }
+    if (!g_engine.working() || !fileTypeAllowsCheck()) { NSBeep(); return; }
     intptr_t len = sciLen();
     if (len == 0) { NSBeep(); return; }
     intptr_t cur = sci(SCI_GETCURRENTPOS);
+    sci(SCI_COLOURISE, 0, (intptr_t)-1);   // ensure styles for the whole doc
     std::string all = sciGetRange(0, len);
     auto toks = tokenize(all);
     // build misspelled token ranges
     std::vector<std::pair<intptr_t,intptr_t>> bad;
-    for (auto &t : toks) { std::string w = trimApostrophes(t.text); if (shouldCheckWord(w) && !g_engine.check(w)) bad.push_back({t.start, t.end}); }
+    for (auto &t : toks) { std::string w = trimApostrophes(t.text); if (shouldCheckWord(w) && styleAllowsCheck(t.start) && !g_engine.check(w)) bad.push_back({t.start, t.end}); }
     if (bad.empty()) { NSBeep(); return; }
     if (forward) {
         for (auto &b : bad) if (b.first >= cur) { sci(SCI_SETSEL, (uintptr_t)b.first, b.second); sci(SCI_SCROLLCARET); recheckVisible(); return; }
@@ -594,11 +651,12 @@ static void findMistake(bool forward) {
 // ===========================================================================
 static std::vector<std::string> allMisspellings() {
     std::set<std::string> uniq; std::vector<std::string> order;
-    intptr_t len = sciLen(); if (len == 0) return order;
+    intptr_t len = sciLen(); if (len == 0 || !fileTypeAllowsCheck()) return order;
+    sci(SCI_COLOURISE, 0, (intptr_t)-1);
     std::string all = sciGetRange(0, len);
     for (auto &t : tokenize(all)) {
         std::string w = trimApostrophes(t.text);
-        if (shouldCheckWord(w) && !g_engine.check(w)) { if (uniq.insert(w).second) order.push_back(w); }
+        if (shouldCheckWord(w) && styleAllowsCheck(t.start) && !g_engine.check(w)) { if (uniq.insert(w).second) order.push_back(w); }
     }
     return order;
 }
@@ -682,19 +740,21 @@ static void cmdAdditionalActions() {
         add(@"Erase All Misspelled Words", ^{
             auto words = allMisspellings(); (void)words; // erase performed below
             // erase by scanning whole doc back-to-front
+            sci(SCI_COLOURISE, 0, (intptr_t)-1);
             intptr_t len = sciLen(); std::string all = sciGetRange(0, len);
             auto toks = tokenize(all);
             sci(SCI_BEGINUNDOACTION);
             for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
                 std::string w = trimApostrophes(it->text);
-                if (shouldCheckWord(w) && !g_engine.check(w)) replaceRange(it->start, it->end, "");
+                if (shouldCheckWord(w) && styleAllowsCheck(it->start) && !g_engine.check(w)) replaceRange(it->start, it->end, "");
             }
             sci(SCI_ENDUNDOACTION); recheckVisible();
         });
         add(@"Bookmark Lines with Misspelling", ^{
+            sci(SCI_COLOURISE, 0, (intptr_t)-1);
             intptr_t len = sciLen(); std::string all = sciGetRange(0, len);
             std::set<intptr_t> lines;
-            for (auto &t : tokenize(all)) { std::string w = trimApostrophes(t.text); if (shouldCheckWord(w) && !g_engine.check(w)) lines.insert(sci(SCI_LINEFROMPOSITION,(uintptr_t)t.start)); }
+            for (auto &t : tokenize(all)) { std::string w = trimApostrophes(t.text); if (shouldCheckWord(w) && styleAllowsCheck(t.start) && !g_engine.check(w)) lines.insert(sci(SCI_LINEFROMPOSITION,(uintptr_t)t.start)); }
             // Host draws bookmarks on Scintilla marker 20 (kBookmarkMarker); NPPM_GETBOOKMARKID
             // reports 24 but the host actually uses 20, so use 20 to match what's visible.
             for (auto ln : lines) { sci(SCI_MARKERADD, (uintptr_t)ln, 20); }
@@ -854,7 +914,9 @@ static void showDownloadDialog();   // defined in download phase
     _radioNotThose.state = g_set.check_those ? NSControlStateValueOff : NSControlStateValueOn;
     _fileTypes.stringValue = stdToNs(g_set.file_types);
     _cbSelectWord.state = g_set.select_word_on_context_menu_click ? NSControlStateValueOn : NSControlStateValueOff;
-    _cbComments.state = NSControlStateValueOn; _cbStrings.state = NSControlStateValueOn; // cosmetic defaults
+    _cbComments.state = g_set.check_comments ? NSControlStateValueOn : NSControlStateValueOff;
+    _cbStrings.state  = g_set.check_strings ? NSControlStateValueOn : NSControlStateValueOff;
+    _cbVarNames.state = g_set.check_variable_functions ? NSControlStateValueOn : NSControlStateValueOff;
     _igDigit.state = g_set.ignore_containing_digit ? NSControlStateValueOn : NSControlStateValueOff;
     _igStartCap.state = g_set.ignore_starting_with_capital ? NSControlStateValueOn : NSControlStateValueOff;
     _igHaveCap.state = g_set.ignore_having_a_capital ? NSControlStateValueOn : NSControlStateValueOff;
@@ -896,6 +958,9 @@ static void showDownloadDialog();   // defined in download phase
     g_set.suggestion_count = std::max(1, _maxSugg.intValue);
     g_set.check_those = (_radioThose.state == NSControlStateValueOn);
     g_set.file_types = nsToStd(_fileTypes.stringValue);
+    g_set.check_comments = (_cbComments.state == NSControlStateValueOn);
+    g_set.check_strings = (_cbStrings.state == NSControlStateValueOn);
+    g_set.check_variable_functions = (_cbVarNames.state == NSControlStateValueOn);
     g_set.select_word_on_context_menu_click = (_cbSelectWord.state == NSControlStateValueOn);
     g_set.ignore_containing_digit = (_igDigit.state == NSControlStateValueOn);
     g_set.ignore_starting_with_capital = (_igStartCap.state == NSControlStateValueOn);

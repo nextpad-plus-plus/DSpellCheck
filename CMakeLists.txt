@@ -26,10 +26,12 @@ target_compile_options(hunspell PRIVATE -w)   # silence 3rd-party warnings
 # ---- plugin ----
 add_library(DSpellCheck SHARED
     src/DSpellCheck.mm
+    src/StyleCategory.cpp
 )
 target_include_directories(DSpellCheck PRIVATE
     ${NPP_PLUGIN_INCLUDE}
     ${SCINTILLA_INCLUDE}
+    "${CMAKE_SOURCE_DIR}/deps/scilexer"
     "${CMAKE_SOURCE_DIR}/deps/hunspell-src"
     src)
 target_compile_definitions(DSpellCheck PRIVATE HUNSPELL_STATIC)
