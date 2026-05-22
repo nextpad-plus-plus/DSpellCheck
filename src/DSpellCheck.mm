@@ -126,6 +126,7 @@ struct Settings {
     bool select_word_on_context_menu_click = true;
     std::string language_name_style = "english"; // original/english/native
     std::string hunspell_user_path;          // dict dir (user)
+    bool write_debug_log = false;
 };
 static Settings g_set;
 
@@ -142,6 +143,15 @@ static std::string dictDir() {
     return d;
 }
 static std::string iniPath() { return configDir() + "/DSpellCheck.ini"; }
+static std::string debugLogPath() { return configDir() + "/DSpellCheck_debug.log"; }
+static void dbg(const std::string &msg) {
+    if (!g_set.write_debug_log) return;
+    @autoreleasepool {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init]; df.dateFormat = @"HH:mm:ss.SSS";
+        std::string line = nsToStd([df stringFromDate:[NSDate date]]) + "  " + msg + "\n";
+        FILE *fp = fopen(debugLogPath().c_str(), "a"); if (fp) { fputs(line.c_str(), fp); fclose(fp); }
+    }
+}
 
 static void loadSettings() {
     @autoreleasepool {
@@ -180,6 +190,7 @@ static void loadSettings() {
         B("select_word_on_context_menu_click", g_set.select_word_on_context_menu_click);
         S("language_name_style", g_set.language_name_style);
         S("hunspell_user_path", g_set.hunspell_user_path);
+        B("write_debug_log", g_set.write_debug_log);
     }
 }
 static void saveSettings() {
@@ -211,6 +222,7 @@ static void saveSettings() {
         B("select_word_on_context_menu_click", g_set.select_word_on_context_menu_click);
         S("language_name_style", g_set.language_name_style);
         S("hunspell_user_path", g_set.hunspell_user_path);
+        B("write_debug_log", g_set.write_debug_log);
         [stdToNs(o) writeToFile:stdToNs(iniPath()) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 }
@@ -693,6 +705,7 @@ static void ignoreWordAtCursor() {
 // ===========================================================================
 static void doRecheckSoon();
 static void showDownloadDialog();
+static void showMultiLanguageDialog();
 
 static void cmdAutoCheck() {
     g_set.auto_check_text = !g_set.auto_check_text;
@@ -712,14 +725,20 @@ static void cmdChangeLang() {
             NSMenuItem *mi = [[NSMenuItem alloc] initWithTitle:@"(no dictionaries installed)" action:nil keyEquivalent:@""];
             mi.enabled = NO; [menu addItem:mi];
         } else {
+            std::string multi = ";" + g_set.multi_languages + ";";
             for (auto &kv : g_engine.available) {
                 NSMenuItem *mi = [[NSMenuItem alloc] initWithTitle:languageDisplayName(kv.first) action:@selector(pickLanguage:) keyEquivalent:@""];
                 mi.target = act; mi.representedObject = stdToNs(kv.first);
-                if (!g_set.multi_mode && kv.first == g_set.language) mi.state = NSControlStateValueOn;
+                if (g_set.multi_mode) { if (multi.find(";" + kv.first + ";") != std::string::npos) mi.state = NSControlStateValueOn; }
+                else if (kv.first == g_set.language) mi.state = NSControlStateValueOn;
                 [menu addItem:mi];
             }
         }
         [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *ml = [[NSMenuItem alloc] initWithTitle:@"Multiple Languages…" action:@selector(invokeBlock:) keyEquivalent:@""];
+        ml.target = [DSCBlockInvoker shared]; ml.state = g_set.multi_mode ? NSControlStateValueOn : NSControlStateValueOff;
+        ml.representedObject = [^{ showMultiLanguageDialog(); } copy];
+        [menu addItem:ml];
         NSMenuItem *dl = [[NSMenuItem alloc] initWithTitle:@"Download Languages…" action:@selector(invokeBlock:) keyEquivalent:@""];
         dl.target = [DSCBlockInvoker shared];
         dl.representedObject = [^{ showDownloadDialog(); } copy];
@@ -763,6 +782,18 @@ static void cmdAdditionalActions() {
         add(@"Ignore Word at Cursor", ^{ ignoreWordAtCursor(); });
         add(@"Show Suggestions Menu at Cursor", ^{ showSuggestionsForPosition(sci(SCI_GETCURRENTPOS)); });
         add(@"Reload Hunspell Dictionaries", ^{ g_engine.scan(); if (!g_set.multi_mode) g_engine.setLanguage(g_set.language); recheckVisible(); });
+        NSMenuItem *dbgItem = [[NSMenuItem alloc] initWithTitle:@"Enable Debug Logging" action:@selector(invokeBlock:) keyEquivalent:@""];
+        dbgItem.target = [DSCBlockInvoker shared];
+        dbgItem.state = g_set.write_debug_log ? NSControlStateValueOn : NSControlStateValueOff;
+        dbgItem.representedObject = [^{ g_set.write_debug_log = !g_set.write_debug_log; saveSettings(); dbg("debug logging enabled"); } copy];
+        [menu addItem:dbgItem];
+        add(@"Open Debug Log…", ^{
+            std::string p = debugLogPath();
+            if (![[NSFileManager defaultManager] fileExistsAtPath:stdToNs(p)])
+                [@"" writeToFile:stdToNs(p) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            if (npp(NPPM_DOOPEN, 0, (intptr_t)p.c_str()) == 0)   // open in editor; fall back to default app
+                [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:stdToNs(p)]];
+        });
         [menu popUpMenuPositioningItem:nil atLocation:[NSEvent mouseLocation] inView:nil];
     }
 }
@@ -1214,6 +1245,65 @@ static void showDownloadDialog() {
 }
 
 // ===========================================================================
+// Multiple Languages selection dialog
+// ===========================================================================
+@interface DSCMultiLang : NSObject <NSWindowDelegate>
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) NSMutableArray<NSButton *> *checks;
+@property(nonatomic, strong) NSMutableArray<NSString *> *codes;
+@property(nonatomic, assign) BOOL accepted;
+@end
+@implementation DSCMultiLang
+- (instancetype)init { if ((self = [super init])) { _checks = [NSMutableArray array]; _codes = [NSMutableArray array]; [self build]; } return self; }
+- (void)build {
+    g_engine.scan();
+    NSInteger n = (NSInteger)g_engine.available.size();
+    CGFloat listH = MAX(60, MIN(360, n * 22 + 8));
+    _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 340, listH + 70)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable) backing:NSBackingStoreBuffered defer:YES];
+    _window.title = @"Multiple Languages"; _window.releasedWhenClosed = NO; _window.delegate = self;
+    NSView *root = _window.contentView;
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 56, 316, listH)];
+    scroll.hasVerticalScroller = YES; scroll.borderType = NSBezelBorder;
+    NSView *doc = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 296, n * 22 + 8)];
+    std::string multi = ";" + g_set.multi_languages + ";";
+    CGFloat y = n * 22 - 14;
+    for (auto &kv : g_engine.available) {
+        NSButton *cb = [NSButton checkboxWithTitle:languageDisplayName(kv.first) target:nil action:nil];
+        cb.frame = NSMakeRect(6, y, 286, 20);
+        if (g_set.multi_mode && multi.find(";" + kv.first + ";") != std::string::npos) cb.state = NSControlStateValueOn;
+        [doc addSubview:cb]; [_checks addObject:cb]; [_codes addObject:stdToNs(kv.first)];
+        y -= 22;
+    }
+    scroll.documentView = doc; [root addSubview:scroll];
+    NSButton *ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(ok:)]; ok.frame = NSMakeRect(150, 14, 84, 30); ok.keyEquivalent = @"\r"; [root addSubview:ok];
+    NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(cancel:)]; cancel.frame = NSMakeRect(244, 14, 84, 30); cancel.keyEquivalent = @"\e"; [root addSubview:cancel];
+}
+- (void)ok:(id)s {
+    std::vector<std::string> sel;
+    for (NSUInteger i = 0; i < self.checks.count; ++i) if (self.checks[i].state == NSControlStateValueOn) sel.push_back(nsToStd(self.codes[i]));
+    if (sel.empty()) { g_set.multi_mode = false; g_engine.setLanguage(g_set.language); }
+    else {
+        std::string joined; for (size_t i = 0; i < sel.size(); ++i) { if (i) joined += ";"; joined += sel[i]; }
+        g_set.multi_languages = joined; g_set.multi_mode = true; g_engine.setMultiLanguages(sel);
+    }
+    saveSettings(); recheckVisible();
+    [NSApp stopModal];
+}
+- (void)cancel:(id)s { [NSApp stopModal]; }
+- (void)windowWillClose:(NSNotification *)n { [NSApp stopModal]; }
+- (void)run { [self.window center]; [NSApp runModalForWindow:self.window]; [self.window orderOut:nil]; }
+@end
+
+static void showMultiLanguageDialog() {
+    @autoreleasepool {
+        static DSCMultiLang *dlg = nil;
+        dlg = [[DSCMultiLang alloc] init];
+        [dlg run];
+    }
+}
+
+// ===========================================================================
 // Debounced recheck on edit/scroll
 // ===========================================================================
 static void doRecheckSoon() {
@@ -1274,7 +1364,14 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     memset(funcItem, 0, sizeof(funcItem));
     loadSettings();
     g_engine.scan();
-    if (!g_set.multi_mode) g_engine.setLanguage(g_set.language);
+    if (g_set.multi_mode && !g_set.multi_languages.empty()) {
+        std::vector<std::string> langs; std::string cur;
+        for (char c : g_set.multi_languages) { if (c == ';') { if (!cur.empty()) langs.push_back(cur); cur.clear(); } else cur += c; }
+        if (!cur.empty()) langs.push_back(cur);
+        g_engine.setMultiLanguages(langs);
+    } else {
+        g_engine.setLanguage(g_set.language);
+    }
     setItem(MI_AutoCheck, "Spell Check Document Automatically", cmdAutoCheck, g_set.auto_check_text);
     setItem(MI_FindNext, "Find Next Misspelling", cmdFindNext);
     setItem(MI_FindPrev, "Find Previous Misspelling", cmdFindPrev);
