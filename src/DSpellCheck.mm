@@ -958,28 +958,31 @@ static void doRecheckSoon() {
 }
 
 // ===========================================================================
-// Right-click on a misspelled word → suggestions popup (Windows context-menu
-// behavior). App-wide local NSEvent monitor; consumes the event only when it
-// lands on a misspelled word in the editor, otherwise passes through so the
-// normal context menu still appears.
+// Left single-click on a misspelled word → suggestions popup.
+//
+// App-wide local monitor on leftMouseUp. The click is never consumed (normal
+// caret placement / editing is preserved); after the click is processed we read
+// the caret position (so no coordinate mapping is needed) and, if it's a plain
+// click — not a drag-selection — on a misspelled word, we show the suggestions.
+// This avoids fighting the host's right-click context menu entirely.
 // ===========================================================================
-static id g_rightClickMonitor = nil;
-static void installRightClickMonitor() {
-    if (g_rightClickMonitor) return;
-    g_rightClickMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskRightMouseDown
+static id g_clickMonitor = nil;
+static void installClickMonitor() {
+    if (g_clickMonitor) return;
+    g_clickMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseUp
         handler:^NSEvent *(NSEvent *e) {
-            if (!g_set.auto_check_text || !g_engine.working() || !e.window) return e;
-            NSView *hit = [e.window.contentView hitTest:e.locationInWindow];
-            if (!hit) return e;
-            NSPoint p = [hit convertPoint:e.locationInWindow fromView:nil];
-            intptr_t pos = sci(SCI_POSITIONFROMPOINTCLOSE, (uintptr_t)(NSInteger)p.x, (intptr_t)(NSInteger)p.y);
-            if (pos < 0) return e;
-            intptr_t ws, we; std::string word;
-            if (!wordAt(pos, ws, we, word)) return e;
-            std::string w = trimApostrophes(word);
-            if (!shouldCheckWord(w) || g_engine.check(w)) return e; // not a misspelling → default menu
-            dispatch_async(dispatch_get_main_queue(), ^{ showSuggestionsForPosition(pos); });
-            return (NSEvent *)nil; // consume — show our suggestions instead
+            if (!g_set.auto_check_text || !g_engine.working()) return e;
+            if (e.clickCount != 1) return e;   // ignore double/triple clicks
+            // defer until after Scintilla has processed the click and moved the caret
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (sci(SCI_GETSELECTIONSTART) != sci(SCI_GETSELECTIONEND)) return; // was a drag-select
+                intptr_t pos = sci(SCI_GETCURRENTPOS);
+                intptr_t ws, we; std::string word;
+                if (!wordAt(pos, ws, we, word)) return;
+                std::string w = trimApostrophes(word);
+                if (shouldCheckWord(w) && !g_engine.check(w)) showSuggestionsForPosition(pos);
+            });
+            return e; // never consume left clicks
         }];
 }
 
@@ -1022,7 +1025,7 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
     if (!n) return;
     switch (n->nmhdr.code) {
         case NPPN_TBMODIFICATION: handleToolbarModification(); break;
-        case NPPN_READY: applyIndicatorStyle(); installRightClickMonitor(); if (g_set.auto_check_text) recheckVisible(); break;
+        case NPPN_READY: applyIndicatorStyle(); installClickMonitor(); if (g_set.auto_check_text) recheckVisible(); break;
         case NPPN_BUFFERACTIVATED: if (g_set.auto_check_text) doRecheckSoon(); break;
         case SCN_MODIFIED:
             if ((n->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) && g_set.auto_check_text) doRecheckSoon();
